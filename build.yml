@@ -1,0 +1,402 @@
+name: Gerar APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Criar projeto
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "TempArrefecimento"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.fabio.coolant"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.fabio.coolant"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          // Sem dependências extras: app enxuto.
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+              <application
+                  android:label="Temp. Arrefecimento"
+                  android:theme="@android:style/Theme.DeviceDefault">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CoolantService"
+                      android:exported="false"
+                      android:foregroundServiceType="connectedDevice" />
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/fabio/coolant
+          cat > app/src/main/java/com/fabio/coolant/CoolantService.kt <<'EOF_FILE'
+          package com.fabio.coolant
+
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.bluetooth.BluetoothManager
+          import android.bluetooth.BluetoothSocket
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Typeface
+          import android.graphics.drawable.Icon
+          import android.os.Build
+          import android.os.IBinder
+          import java.io.IOException
+          import java.util.UUID
+
+          @SuppressLint("MissingPermission")
+          class CoolantService : Service() {
+
+              companion object {
+                  const val PREFS = "cfg"
+                  const val KEY_MAC = "mac"
+                  const val KEY_LIMIT = "limit"
+                  private const val CH_STATUS = "status"
+                  private const val CH_ALERT = "alerta"
+                  private const val ID_STATUS = 1
+                  private const val ID_ALERT = 2
+                  private val SPP: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+              }
+
+              @Volatile private var running = false
+              private var worker: Thread? = null
+              private var alerted = false
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CH_STATUS, "Temperatura", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  nm.createNotificationChannel(
+                      NotificationChannel(CH_ALERT, "Alerta de temperatura", NotificationManager.IMPORTANCE_HIGH)
+                  )
+
+                  val n = buildStatus("Conectando ao scanner…")
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(ID_STATUS, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+                  } else {
+                      startForeground(ID_STATUS, n)
+                  }
+
+                  if (!running) {
+                      running = true
+                      worker = Thread { loop() }.also { it.start() }
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  worker?.interrupt()
+                  super.onDestroy()
+              }
+
+              private fun loop() {
+                  val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+                  val mac = prefs.getString(KEY_MAC, null)
+                  if (mac == null) {
+                      update("Nenhum scanner selecionado")
+                      return
+                  }
+                  while (running) {
+                      var socket: BluetoothSocket? = null
+                      try {
+                          val adapter = getSystemService(BluetoothManager::class.java).adapter
+                          adapter.cancelDiscovery()
+                          socket = adapter.getRemoteDevice(mac).createRfcommSocketToServiceRecord(SPP)
+                          socket.connect()
+                          val input = socket.inputStream
+                          val output = socket.outputStream
+
+                          for (cmd in listOf("ATZ", "ATE0", "ATL0", "ATS0", "ATSP0")) {
+                              send(cmd, input, output)
+                          }
+
+                          while (running) {
+                              val resp = send("0105", input, output)
+                              val temp = parseTemp(resp)
+                              if (temp != null) {
+                                  update("Arrefecimento: $temp °C", temp)
+                                  checkAlert(temp, prefs.getInt(KEY_LIMIT, 105))
+                              } else {
+                                  update("Sem leitura (${resp.trim().take(20)})")
+                              }
+                              Thread.sleep(2000)
+                          }
+                      } catch (e: InterruptedException) {
+                          break
+                      } catch (e: Exception) {
+                          update("Sem conexão – tentando de novo…")
+                          try { Thread.sleep(5000) } catch (_: InterruptedException) { break }
+                      } finally {
+                          try { socket?.close() } catch (_: IOException) {}
+                      }
+                  }
+              }
+
+              /** Envia o comando e lê até o prompt '>' (timeout de 5 s). */
+              private fun send(cmd: String, input: java.io.InputStream, output: java.io.OutputStream): String {
+                  output.write((cmd + "\r").toByteArray())
+                  output.flush()
+                  val sb = StringBuilder()
+                  val deadline = System.currentTimeMillis() + 5000
+                  while (System.currentTimeMillis() < deadline) {
+                      if (input.available() > 0) {
+                          val c = input.read()
+                          if (c < 0) throw IOException("fim do stream")
+                          if (c.toChar() == '>') return sb.toString()
+                          sb.append(c.toChar())
+                      } else {
+                          Thread.sleep(30)
+                      }
+                  }
+                  throw IOException("timeout")
+              }
+
+              /** Resposta esperada: "41 05 5A" -> 0x5A - 40 = 50 °C */
+              private fun parseTemp(resp: String): Int? {
+                  val clean = resp.replace(" ", "").replace("\r", "").replace("\n", "").uppercase()
+                  val i = clean.indexOf("4105")
+                  if (i < 0 || clean.length < i + 6) return null
+                  val v = clean.substring(i + 4, i + 6).toIntOrNull(16) ?: return null
+                  return v - 40
+              }
+
+              private fun checkAlert(temp: Int, limit: Int) {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  if (temp >= limit && !alerted) {
+                      alerted = true
+                      val n = Notification.Builder(this, CH_ALERT)
+                          .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                          .setContentTitle("MOTOR QUENTE: $temp °C")
+                          .setContentText("Passou do limite de $limit °C")
+                          .setAutoCancel(true)
+                          .build()
+                      nm.notify(ID_ALERT, n)
+                  } else if (temp < limit - 5) {
+                      alerted = false
+                  }
+              }
+
+              /** Desenha o número da temperatura como ícone da barra de status. */
+              private fun tempIcon(t: Int): Icon {
+                  val size = 96
+                  val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(bmp)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.WHITE
+                      typeface = Typeface.DEFAULT_BOLD
+                      textAlign = Paint.Align.CENTER
+                      textSize = 80f
+                  }
+                  val s = t.toString()
+                  while (p.measureText(s) > size - 4 && p.textSize > 20f) p.textSize -= 2f
+                  val y = size / 2f - (p.descent() + p.ascent()) / 2f
+                  c.drawText(s, size / 2f, y, p)
+                  return Icon.createWithBitmap(bmp)
+              }
+
+              private fun buildStatus(text: String, temp: Int? = null): Notification =
+                  Notification.Builder(this, CH_STATUS)
+                      .apply {
+                          if (temp != null) setSmallIcon(tempIcon(temp))
+                          else setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                      }
+                      .setContentTitle(text)
+                      .setOngoing(true)
+                      .setOnlyAlertOnce(true)
+                      .setContentIntent(
+                          android.app.PendingIntent.getActivity(
+                              this, 0, Intent(this, MainActivity::class.java),
+                              android.app.PendingIntent.FLAG_IMMUTABLE
+                          )
+                      )
+                      .build()
+
+              private fun update(text: String, temp: Int? = null) {
+                  getSystemService(NotificationManager::class.java).notify(ID_STATUS, buildStatus(text, temp))
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/fabio/coolant
+          cat > app/src/main/java/com/fabio/coolant/MainActivity.kt <<'EOF_FILE'
+          package com.fabio.coolant
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.bluetooth.BluetoothDevice
+          import android.bluetooth.BluetoothManager
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.text.InputType
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+
+          @SuppressLint("MissingPermission")
+          class MainActivity : Activity() {
+
+              private lateinit var info: TextView
+              private lateinit var list: ListView
+              private lateinit var limitEdit: EditText
+              private var devices: List<BluetoothDevice> = emptyList()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences(CoolantService.PREFS, MODE_PRIVATE)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(32, 32, 32, 32)
+                  }
+                  info = TextView(this).apply { textSize = 16f }
+                  list = ListView(this)
+                  limitEdit = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                      hint = "Limite do alerta (°C)"
+                      setText(prefs.getInt(CoolantService.KEY_LIMIT, 105).toString())
+                  }
+                  val start = Button(this).apply { text = "Iniciar" }
+                  val stop = Button(this).apply { text = "Parar" }
+
+                  root.addView(info)
+                  root.addView(list, LinearLayout.LayoutParams(-1, 0, 1f))
+                  root.addView(limitEdit)
+                  root.addView(start)
+                  root.addView(stop)
+                  setContentView(root)
+
+                  list.setOnItemClickListener { _, _, pos, _ ->
+                      val d = devices[pos]
+                      prefs.edit().putString(CoolantService.KEY_MAC, d.address).apply()
+                      refreshInfo()
+                  }
+                  start.setOnClickListener {
+                      val lim = limitEdit.text.toString().toIntOrNull() ?: 105
+                      prefs.edit().putInt(CoolantService.KEY_LIMIT, lim).apply()
+                      if (prefs.getString(CoolantService.KEY_MAC, null) == null) {
+                          info.text = "Toque num scanner da lista primeiro."
+                      } else {
+                          startForegroundService(Intent(this, CoolantService::class.java))
+                      }
+                  }
+                  stop.setOnClickListener { stopService(Intent(this, CoolantService::class.java)) }
+
+                  askPermissions()
+              }
+
+              private fun askPermissions() {
+                  val need = mutableListOf<String>()
+                  if (Build.VERSION.SDK_INT >= 31 &&
+                      checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+                  ) need += Manifest.permission.BLUETOOTH_CONNECT
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) need += Manifest.permission.POST_NOTIFICATIONS
+                  if (need.isEmpty()) loadDevices() else requestPermissions(need.toTypedArray(), 1)
+              }
+
+              override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
+                  super.onRequestPermissionsResult(code, perms, res)
+                  loadDevices()
+              }
+
+              private fun loadDevices() {
+                  val adapter = getSystemService(BluetoothManager::class.java).adapter
+                  devices = adapter?.bondedDevices?.toList() ?: emptyList()
+                  list.adapter = ArrayAdapter(
+                      this, android.R.layout.simple_list_item_1,
+                      devices.map { "${it.name}\n${it.address}" }
+                  )
+                  refreshInfo()
+              }
+
+              private fun refreshInfo() {
+                  val mac = getSharedPreferences(CoolantService.PREFS, MODE_PRIVATE)
+                      .getString(CoolantService.KEY_MAC, null)
+                  info.text = if (mac == null)
+                      "1) Pareie o scanner nas configurações de Bluetooth do celular (senha 1234 ou 0000).\n2) Toque nele abaixo."
+                  else "Scanner selecionado: $mac"
+              }
+          }
+          EOF_FILE
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TempArrefecimento-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
